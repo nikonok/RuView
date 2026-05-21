@@ -1,3 +1,6 @@
-0.6.6
-git-sha: cbcb389cb (pre-commit)
+0.6.6+local.widen-csi-filter
+upstream-base: cbcb389cb
+patch: csi_collector.c — promiscuous filter MGMT-only → MGMT|DATA
 built: 2026-05-21
+target: esp32s3 (16MB flash, 8MB partition table)
+4mb variants (esp32-csi-node-4mb.bin, partition-table-4mb.bin): unchanged stock

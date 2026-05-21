@@ -1,5 +1,75 @@
 # Claude Code Configuration — WiFi-DensePose + Claude Flow V3
 
+> ## Local fork (nikonok/RuView, branch `local/widen-csi-filter`)
+>
+> **This is a fork of `ruvnet/RuView` with one firmware patch.** Upstream-tracking branch
+> is `main`; the patched build lives on `local/widen-csi-filter`. Parent project consuming
+> this submodule: `github.com/nikonok/ruview-setup`.
+>
+> ### The patch
+>
+> `firmware/esp32-csi-node/main/csi_collector.c` — promiscuous filter widened from
+> `WIFI_PROMIS_FILTER_MASK_MGMT` to `WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA`.
+>
+> **Why**: upstream main uses MGMT-only as defense against an SPI flash cache crash
+> (`wDev_ProcessFiq` LoadProhibited at >100 cb/sec). On an ESP32-S3 + 2.4 GHz WiFi-6 AP combo,
+> MGMT-only produces zero CSI callbacks — beacons alone don't trigger CSI there. Re-adding
+> DATA restores callbacks; the 50 Hz rate gate in v0.6.6 (`CSI_MIN_PROCESS_INTERVAL_US`) keeps
+> the rate at ~38-40 cb/sec, well below the crash threshold. Verified: 1200+ callbacks in 30 s,
+> no panic, `state=5 SENSE_IDLE`, `yield≈38pps`, server reports `source: "esp32"`.
+>
+> ### Pre-built patched binaries (8 MB target)
+>
+> `firmware/esp32-csi-node/release_bins/` has been overwritten on this branch with the
+> patched 8 MB-target binaries — so `scripts/flash.sh` flashes the working firmware by
+> default. The 4 MB variants (`*-4mb.bin`) are unchanged stock — flash those manually if
+> you have a 4 MB-flash board, but they don't include the patch.
+>
+> Version label in `release_bins/version.txt`: `0.6.6+local.widen-csi-filter`.
+>
+> ### Rebuilding from source
+>
+> Requires ESP-IDF v6.0 (tested with `release/v6.0`):
+>
+> ```bash
+> source ~/esp-idf/export.sh
+> cd firmware/esp32-csi-node
+> idf.py build
+> # outputs land in build/; copy to release_bins/ if you want them committed
+> ```
+>
+> ### Flashing the patched binary directly (without scripts)
+>
+> ```bash
+> ~/.local/bin/esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 460800 \
+>   --before default-reset --after hard-reset write-flash \
+>   --flash-mode dio --flash-size 8MB --flash-freq 80m \
+>   0x0     firmware/esp32-csi-node/release_bins/bootloader.bin \
+>   0x8000  firmware/esp32-csi-node/release_bins/partition-table.bin \
+>   0xf000  firmware/esp32-csi-node/release_bins/ota_data_initial.bin \
+>   0x20000 firmware/esp32-csi-node/release_bins/esp32-csi-node.bin
+> ```
+>
+> ### Pulling upstream changes
+>
+> ```bash
+> git fetch upstream
+> git checkout main && git merge upstream/main && git push origin main
+> git checkout local/widen-csi-filter && git rebase main
+> # if csi_collector.c conflicts, re-apply the filter widening then continue
+> idf.py build && cp build/.../*.bin release_bins/   # refresh binaries
+> ```
+>
+> ### Anchors for future-me
+>
+> - The patch is one line in `csi_collector.c` — search for `WIFI_PROMIS_FILTER_MASK_MGMT`.
+> - Don't disable `htltf_en` / `stbc_htltf2_en`. That was the c442669e feature-branch config;
+>   it also yielded zero on our AP. The filter mask was the real gate, not HT-LTF processing.
+> - The 50 Hz rate gate (`CSI_MIN_PROCESS_INTERVAL_US`, already in v0.6.6 source) is what
+>   makes MGMT|DATA safe again. Don't remove it.
+
+---
+
 ## Project: wifi-densepose
 
 WiFi-based human pose estimation using Channel State Information (CSI).
