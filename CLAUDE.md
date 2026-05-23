@@ -70,6 +70,81 @@
 
 ---
 
+> ## Local server patches (2026-05-23)
+>
+> Three server-side bug fixes applied on top of the upstream Rust source. **Firmware
+> is unchanged — the wire format per ADR-018 is correct; the bugs were all in the
+> server.** These do NOT require re-flashing any ESP32 board.
+>
+> The upstream published image `ruvnet/wifi-densepose:latest` does **not** contain
+> these fixes. To take effect, the server image must be rebuilt locally from this
+> fork and the consuming `ruview-setup` `docker-compose.yml` pointed at the local
+> tag — see "Rebuild the server image" below.
+>
+> ### What was fixed
+>
+> 1. **UDP CSI parser byte-offset error** (`v2/crates/wifi-densepose-sensing-server/src/main.rs`
+>    `parse_esp32_frame`, and the duplicate in `csi.rs`). `freq_mhz` was being read as a
+>    2-byte `u16` instead of the wire-format 4-byte `u32`, which shifted every following
+>    field — `sequence`, `rssi`, `noise_floor` — by 2 bytes. The visible symptom was
+>    every board in a frame reporting an identical `rssi_dbm` (the high byte of the
+>    sequence counter). Real per-board RSSI is now read correctly.
+>
+> 2. **`classification.confidence ≡ 0.333` ceiling**
+>    (`v2/crates/wifi-densepose-sensing-server/src/main.rs` around the per-node
+>    confidence update). `estimate_persons_from_correlation` (the min-cut estimator)
+>    is degenerate on ESP32 CSI — subcarrier correlation is high enough that
+>    `cut_ratio > 0.4` always fires and the function always returns 1, capping the
+>    per-node `raw_score` at `1/3`. Replaced with a sigmoid of per-node
+>    `features.motion_band_power` against the same 25-unit "active" scale used by
+>    `extract_features_from_frame` — gives a real 0..1 confidence tied to motion.
+>    The original function is kept (`#[allow(dead_code)]`) for future experiments.
+>
+> 3. **Hardcoded `position: [2.0, 0.0, 1.5]` in WS `NodeInfo`**
+>    (three sites in `main.rs`). The `--node-positions` / `SENSING_NODE_POSITIONS`
+>    flag previously only fed the multistatic fuser; the WebSocket frames still
+>    reported the placeholder for every node regardless of configuration. Now
+>    parsed once at startup into `AppStateInner.node_positions` (`HashMap<u8, [f32; 3]>`,
+>    keyed by `node_id` using the `vec_index + 1` convention) and consulted at
+>    each `NodeInfo` construction site via `AppStateInner::node_position_for`.
+>    Falls back to the placeholder for unknown node_ids.
+>
+> Each modified block carries an `Audit 2026-05-23:` comment pointing back here.
+>
+> ### Files changed
+>
+> - `v2/crates/wifi-densepose-sensing-server/src/main.rs` — all three bug fixes,
+>   new `node_positions` field on `AppStateInner`, new `node_position_for` helper.
+> - `v2/crates/wifi-densepose-sensing-server/src/csi.rs` — duplicate parser
+>   fix only (Bug 1).
+>
+> `cargo check -p wifi-densepose-sensing-server --no-default-features` is clean
+> after the patch (only pre-existing warnings remain).
+>
+> ### Rebuild the server image
+>
+> The Dockerfile is in this submodule at `docker/Dockerfile.rust`. From the
+> repo root of *this* submodule (i.e. `…/ruview/RuView/`):
+>
+> ```bash
+> cd /home/anton/Project/ruview/RuView
+> docker build -f docker/Dockerfile.rust -t ruvnet/wifi-densepose:local-patched .
+> ```
+>
+> Then in the consuming `ruview-setup` repo, edit `docker-compose.yml` to point
+> the `sensing-server` service at `ruvnet/wifi-densepose:local-patched` (instead
+> of `:latest`) and `docker compose up -d sensing-server`.
+>
+> Verification once redeployed:
+>
+> - `curl http://SERVER_IP:3000/api/v1/sensing/latest` — `classification.confidence`
+>   should vary with motion instead of being pinned at `0.333…`.
+> - WS frame `nodes[*].rssi_dbm` should differ per board (no longer identical).
+> - WS frame `nodes[*].position` should reflect `SENSING_NODE_POSITIONS` (if set)
+>   instead of every entry being `[2.0, 0.0, 1.5]`.
+
+---
+
 ## Project: wifi-densepose
 
 WiFi-based human pose estimation using Channel State Information (CSI).

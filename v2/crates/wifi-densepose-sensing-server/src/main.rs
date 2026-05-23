@@ -796,6 +796,12 @@ struct AppStateInner {
     pub(crate) dedup_factor: f64,
     /// Data directory for persisting runtime config (parent of `firmware_dir`).
     pub(crate) data_dir: std::path::PathBuf,
+    /// Audit 2026-05-23: per-node position lookup for WS `NodeInfo.position`.
+    /// Populated once at startup from `--node-positions` / `SENSING_NODE_POSITIONS`.
+    /// Previously every node reported the hardcoded `[2.0, 0.0, 1.5]` placeholder.
+    /// Keyed by `node_id` from the ESP32 frame header. Falls back to that
+    /// placeholder for unknown ids — see `node_position_for()`.
+    pub(crate) node_positions: HashMap<u8, [f32; 3]>,
 }
 
 /// If no ESP32 frame arrives within this duration, source reverts to offline.
@@ -828,6 +834,16 @@ impl AppStateInner {
             }
             None => score_to_person_count(self.smoothed_person_score, self.prev_person_count),
         }
+    }
+
+    /// Audit 2026-05-23: per-node position lookup for WS `NodeInfo.position`.
+    /// Returns the position configured via `--node-positions` if present,
+    /// otherwise the historical `[2.0, 0.0, 1.5]` placeholder.
+    fn node_position_for(&self, node_id: u8) -> [f64; 3] {
+        self.node_positions
+            .get(&node_id)
+            .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+            .unwrap_or([2.0, 0.0, 1.5])
     }
 
     fn effective_source(&self) -> String {
@@ -965,7 +981,7 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
         return None;
     }
 
-    // Frame layout (must match firmware csi_collector.c):
+    // Frame layout (must match firmware csi_collector.c and ADR-018):
     //   [0..3]   magic (u32 LE)
     //   [4]      node_id (u8)
     //   [5]      n_antennas (u8)
@@ -976,15 +992,20 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
     //   [17]     noise_floor (i8)
     //   [18..19] reserved
     //   [20..]   I/Q data
+    //
+    // Audit 2026-05-23: previously read freq_mhz as a 2-byte u16, which shifted
+    // sequence/rssi/noise_floor reads 2 bytes early. As a result all 4 boards
+    // reported identical `rssi_dbm` within a frame (high byte of sequence).
+    // See RuView/CLAUDE.md "Local server patches".
     let node_id = buf[4];
     let n_antennas = buf[5];
     let n_subcarriers = buf[6];
-    let freq_mhz = u16::from_le_bytes([buf[8], buf[9]]);
-    let sequence = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]);
-    let rssi_raw = buf[14] as i8;
+    let freq_mhz = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as u16;
+    let sequence = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    let rssi_raw = buf[16] as i8;
     // Fix RSSI sign: ensure it's always negative (dBm convention).
     let rssi = if rssi_raw > 0 { rssi_raw.saturating_neg() } else { rssi_raw };
-    let noise_floor = buf[15] as i8;
+    let noise_floor = buf[17] as i8;
 
     let iq_start = 20;
     let n_pairs = n_antennas as usize * n_subcarriers as usize;
@@ -2526,6 +2547,11 @@ fn compute_person_score(state: &AppStateInner, feat: &FeatureInfo) -> f64 {
 /// - Low min-cut → two loosely coupled groups → 2 persons
 ///
 /// Uses `ruvector_mincut::DynamicMinCut` for O(V²E) exact max-flow.
+///
+/// Audit 2026-05-23: kept for future use / experiments. The previous caller
+/// in the ESP32 path was replaced by a per-node motion-power sigmoid because
+/// this estimator saturates to 1 on ESP32 CSI (cut_ratio > 0.4 always fires).
+#[allow(dead_code)]
 fn estimate_persons_from_correlation(frame_history: &VecDeque<Vec<f64>>) -> usize {
     let n_frames = frame_history.len();
     if n_frames < 10 {
@@ -4046,12 +4072,19 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     }
 
                     // Build nodes array with all active nodes.
+                    // Audit 2026-05-23: look up each node's position via
+                    // `AppStateInner::node_position_for` (configured by
+                    // --node-positions); previously hardcoded.
+                    let node_positions_snapshot = s.node_positions.clone();
                     let active_nodes: Vec<NodeInfo> = s.node_states.iter()
                         .filter(|(_, n)| n.last_frame_time.map_or(false, |t| now.duration_since(t).as_secs() < 10))
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: [2.0, 0.0, 1.5],
+                            position: node_positions_snapshot
+                                .get(&id)
+                                .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+                                .unwrap_or([2.0, 0.0, 1.5]),
                             amplitude: vec![],
                             subcarrier_count: 0,
                         })
@@ -4269,9 +4302,17 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     let vitals = smooth_vitals_node(ns, &raw_vitals);
                     ns.latest_vitals = vitals.clone();
 
-                    // DynamicMinCut person estimation from subcarrier correlation.
-                    let corr_persons = estimate_persons_from_correlation(&ns.frame_history);
-                    let raw_score = corr_persons as f64 / 3.0;
+                    // Audit 2026-05-23: replaced `corr_persons/3.0` because the min-cut
+                    // estimator is degenerate on ESP32 CSI (always returns 1 → 0.333 ceiling).
+                    // See RuView/CLAUDE.md "Local server patches".
+                    //
+                    // New score: sigmoid of per-node motion-band power, normalised
+                    // against the same 25-unit "active" scale used by extract_features
+                    // (see motion_band_power / 25.0 around line 1389). Centred at z=1
+                    // (≈ "active" threshold), gain 3 — gives a smooth 0..1 confidence
+                    // tied to actual per-node activity instead of a stuck min-cut.
+                    let z = features.motion_band_power / 25.0;
+                    let raw_score = 1.0 / (1.0 + (-(3.0 * (z - 1.0))).exp());
                     ns.smoothed_person_score = ns.smoothed_person_score * 0.92 + raw_score * 0.08;
                     if classification.presence {
                         let count = score_to_person_count(ns.smoothed_person_score, ns.prev_person_count);
@@ -4333,12 +4374,19 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     }
 
                     // Build nodes array with all active nodes.
+                    // Audit 2026-05-23: look up each node's position via
+                    // `AppStateInner::node_position_for` (configured by
+                    // --node-positions); previously hardcoded.
+                    let node_positions_snapshot = s.node_positions.clone();
                     let active_nodes: Vec<NodeInfo> = s.node_states.iter()
                         .filter(|(_, n)| n.last_frame_time.map_or(false, |t| now.duration_since(t).as_secs() < 10))
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: [2.0, 0.0, 1.5],
+                            position: node_positions_snapshot
+                                .get(&id)
+                                .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+                                .unwrap_or([2.0, 0.0, 1.5]),
                             amplitude: n.frame_history.back()
                                 .map(|a| a.iter().take(56).cloned().collect())
                                 .unwrap_or_default(),
@@ -4485,7 +4533,9 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
             nodes: vec![NodeInfo {
                 node_id: 1,
                 rssi_dbm: features.mean_rssi,
-                position: [2.0, 0.0, 1.5],
+                // Audit 2026-05-23: previously hardcoded; see
+                // `AppStateInner::node_position_for` for the lookup.
+                position: s.node_position_for(1),
                 amplitude: frame_amplitudes,
                 subcarrier_count: frame_n_sub as usize,
             }],
@@ -5249,6 +5299,22 @@ async fn main() {
         // ADR-044 §5.3: runtime-configurable dedup factor (persisted).
         dedup_factor: runtime_config.dedup_factor,
         data_dir: data_dir.clone(),
+        // Audit 2026-05-23: build the position lookup map once at startup.
+        // Convention: vec index N in --node-positions → node_id (N+1) on the
+        // wire (matches the 1-indexed ESP32 assignment in setup CLAUDE.md).
+        node_positions: {
+            let mut map: HashMap<u8, [f32; 3]> = HashMap::new();
+            if let Some(ref pos_str) = args.node_positions {
+                for (idx, p) in field_bridge::parse_node_positions(pos_str).into_iter().enumerate() {
+                    let id = (idx as u32 + 1) as u8;
+                    map.insert(id, p);
+                }
+                if !map.is_empty() {
+                    info!("Loaded {} per-node positions for WS NodeInfo", map.len());
+                }
+            }
+            map
+        },
     }));
 
     // Start background tasks based on source

@@ -67,14 +67,22 @@ pub fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
     let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     if magic != 0xC511_0001 { return None; }
 
+    // Frame layout (ADR-018, firmware csi_collector.c):
+    //   [0..3] magic | [4] node_id | [5] n_antennas | [6..7] n_subcarriers
+    //   [8..11] freq_mhz (u32 LE) | [12..15] sequence (u32 LE)
+    //   [16] rssi (i8) | [17] noise_floor (i8) | [18..19] reserved | [20..] I/Q
+    //
+    // Audit 2026-05-23: previously read freq_mhz as u16, shifting subsequent
+    // fields by 2 bytes — all boards reported the high byte of `sequence` as
+    // RSSI. See RuView/CLAUDE.md "Local server patches".
     let node_id = buf[4];
     let n_antennas = buf[5];
     let n_subcarriers = buf[6];
-    let freq_mhz = u16::from_le_bytes([buf[8], buf[9]]);
-    let sequence = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]);
-    let rssi_raw = buf[14] as i8;
+    let freq_mhz = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as u16;
+    let sequence = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    let rssi_raw = buf[16] as i8;
     let rssi = if rssi_raw > 0 { rssi_raw.saturating_neg() } else { rssi_raw };
-    let noise_floor = buf[15] as i8;
+    let noise_floor = buf[17] as i8;
 
     let iq_start = 20;
     let n_pairs = n_antennas as usize * n_subcarriers as usize;
